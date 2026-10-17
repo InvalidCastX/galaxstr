@@ -96,3 +96,15 @@ export function saveStoredRelays(storage, list) {
     /* private mode / quota — the URL still carries the setting */
   }
 }
+
+/**
+ * Link to a profile card, carrying the relays in use:
+ *   https://cardstr.pages.dev/#/p/<npub>?relays=relay.bchnostr.com,nos.lol
+ * (wss:// dropped, commas kept literal — same shorthand as the ?relay= URL.)
+ */
+export function buildCardUrl(base, npub, relays = []) {
+  const url = base + npub
+  if (!relays.length) return url
+  const list = relays.map((r) => encodeParam(shorten(r))).join(',')
+  return `${url}${url.includes('?') ? '&' : '?'}relays=${list}`
+}

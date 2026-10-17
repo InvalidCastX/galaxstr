@@ -8,7 +8,8 @@ as "possible" constellations.
 Companion apps:
 - **BCHNostr LiveGrid** — network activity observatory
 - **NostrCards** — identity/profile cards (this app links out to
-  `https://nostrcard.vercel.app/p/<npub>` when you click a star)
+  `https://cardstr.pages.dev/#/p/<npub>?relays=…` when you click a star,
+  passing along the relays you're currently using)
 
 This is a read-only explorer. It never asks for a private key, seed phrase,
 or wallet connection — it only reads public events from relays over
@@ -150,7 +151,7 @@ edited (or swapped per deployment) **without a rebuild**:
     "wss://relay.damus.io",
     "wss://nos.lol"
   ],
-  "nostrCardBaseUrl": "https://nostrcard.vercel.app/#/p/",
+  "nostrCardBaseUrl": "https://cardstr.pages.dev/#/p/",
   "maxProfiles": 500,
   "maxEvents": 5000,
   "maxNodes": 1200,
@@ -165,8 +166,9 @@ edited (or swapped per deployment) **without a rebuild**:
 - `maxNodes` caps how many stars are laid out and drawn (touch devices use
   at most 600). Raise it on powerful machines, lower it if a device struggles.
 - `nostrCardBaseUrl` is prepended to each user's `npub` when the "Open Full
-  NostrCard" button is built — it currently points at NostrCard's hash-route
-  pattern (`.../#/p/npub1...`); update it here if that ever changes.
+  NostrCard" button is built, followed by `?relays=` and your active relays
+  (e.g. `.../#/p/npub1...?relays=relay.bchnostr.com,nos.lol`). Update it here if
+  the card app's route ever changes.
 - If `config.json` is missing or fails to load (e.g. offline), the app falls
   back to the defaults baked into `src/App.vue`, so it's never a hard
   dependency.

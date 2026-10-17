@@ -2,10 +2,12 @@
 import { computed, inject } from 'vue'
 import { hexToNpub } from '../nostr.js'
 import { avatarThumb } from '../image.js'
+import { buildCardUrl } from '../relays.js'
 
 const props = defineProps({
   node: { type: Object, required: true },
-  nostrCardBaseUrl: { type: String, default: 'https://nostrcard.vercel.app/#/p/' }
+  nostrCardBaseUrl: { type: String, default: 'https://cardstr.pages.dev/#/p/' },
+  relays: { type: Array, default: () => [] } // active relays, passed on so the card reads from the same ones
 })
 defineEmits(['close'])
 
@@ -19,7 +21,7 @@ const avatarSrc = computed(() => {
 
 const npub = computed(() => hexToNpub(props.node.id) || props.node.id)
 const shortNpub = computed(() => npub.value.slice(0, 12) + '…' + npub.value.slice(-6))
-const cardUrl = computed(() => props.nostrCardBaseUrl + npub.value)
+const cardUrl = computed(() => buildCardUrl(props.nostrCardBaseUrl, npub.value, props.relays))
 
 const activityLabel = computed(() => {
   const n = props.node

@@ -16,7 +16,7 @@ import { cleanRelays, relaysFromSearch, relaysToSearch, loadStoredRelays, saveSt
 // missing file, etc).
 const config = reactive({
   relays: DEFAULT_RELAYS,
-  nostrCardBaseUrl: 'https://nostrcard.vercel.app/#/p/',
+  nostrCardBaseUrl: 'https://cardstr.pages.dev/#/p/',
   maxProfiles: 500,
   maxEvents: 5000,
   maxNodes: 1200,
@@ -638,7 +638,12 @@ function displayEdges() {
 
     <!-- selected star popup -->
     <div v-if="selectedNode" class="popup-anchor">
-      <ProfilePopup :node="selectedNode" :nostr-card-base-url="config.nostrCardBaseUrl" @close="closePopup" />
+      <ProfilePopup
+        :node="selectedNode"
+        :nostr-card-base-url="config.nostrCardBaseUrl"
+        :relays="activeRelays"
+        @close="closePopup"
+      />
     </div>
   </div>
 

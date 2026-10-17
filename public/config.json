@@ -4,7 +4,7 @@
     "wss://relay.nos.lol",
     "wss://relay.damus.io"
   ],
-  "nostrCardBaseUrl": "https://nostrcard.vercel.app/#/p/",
+  "nostrCardBaseUrl": "https://cardstr.pages.dev/#/p/",
   "maxProfiles": 500,
   "maxEvents": 5000,
   "maxNodes": 1200,

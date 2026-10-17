@@ -233,5 +233,14 @@ t('storage save/load/clear; broken storage never throws', () => {
   R.saveStoredRelays(boom, ['wss://nos.lol']); assert.deepEqual(R.loadStoredRelays(boom), [])
 })
 
+t('card URL matches the cardstr format and carries the relays', () => {
+  const npub = 'npub1madu4w57wnxpwexfwuawzcpfnh094nmeg9hze9n43kazyhn8qlxq4lrgfg'
+  assert.equal(
+    R.buildCardUrl('https://cardstr.pages.dev/#/p/', npub, ['wss://relay.bchnostr.com', 'wss://nos.lol']),
+    'https://cardstr.pages.dev/#/p/' + npub + '?relays=relay.bchnostr.com,nos.lol'
+  )
+  assert.equal(R.buildCardUrl('https://cardstr.pages.dev/#/p/', npub, []), 'https://cardstr.pages.dev/#/p/' + npub)
+})
+
 console.log(failures ? `\n${failures} FAILED` : '\nall passed')
 process.exit(failures ? 1 : 0)
