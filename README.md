@@ -68,6 +68,48 @@ npx wrangler pages deploy dist --project-name galaxstr
 with no extra config. `public/config.json` is served as a static file, so you
 can edit relays and limits in the deployed project without touching code.
 
+## Embedding (iframe)
+
+Galaxstr can skip its landing page and drop straight into the galaxy, so it
+works as a tab inside another app:
+
+```html
+<iframe
+  src="https://galaxstr.pages.dev/?embed=1"
+  style="width:100%;height:100%;border:0"
+  allow="clipboard-write"
+  loading="lazy"
+  title="Galaxstr"
+></iframe>
+```
+
+| Param | Effect |
+| --- | --- |
+| `embed=1` | Skip the landing page and hide Galaxstr's own title (your app has its header) |
+| `landing=0` / `skip=1` | Skip the landing page only |
+| `orbit=npub1…` | Open straight into "Your Orbit" for that identity (npub, nprofile or hex). Keeps trying as more stars load |
+| `relay=a&relay=b` | Use these relays (pass your host app's relays) |
+
+Combine freely, e.g. `?embed=1&orbit=npub1…&relay=relay.damus.io`.
+
+**Messages to the host page** (only when running inside an iframe), via `window.postMessage`:
+
+```js
+window.addEventListener('message', (e) => {
+  if (e.origin !== 'https://galaxstr.pages.dev' || e.data?.source !== 'galaxstr') return
+  if (e.data.type === 'ready')  { /* first stars rendered: { stars } */ }
+  if (e.data.type === 'select') { /* star clicked: { pubkey, npub, name } */ }
+})
+```
+
+Cloudflare Pages sets no `X-Frame-Options` by default, so embedding works out
+of the box. To restrict who can embed it, add `public/_headers`:
+
+```
+/*
+  Content-Security-Policy: frame-ancestors 'self' https://friendstr.pages.dev
+```
+
 ## Relay settings
 
 Click **Relays (n)** (on the landing page or in the bottom bar) to add or

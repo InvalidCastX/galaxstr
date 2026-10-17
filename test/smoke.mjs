@@ -242,5 +242,17 @@ t('card URL matches the cardstr format and carries the relays', () => {
   assert.equal(R.buildCardUrl('https://cardstr.pages.dev/#/p/', npub, []), 'https://cardstr.pages.dev/#/p/' + npub)
 })
 
+// ---------- embed options ----------
+import { parseEmbedParams } from '../src/embed.js'
+console.log('embed.js')
+t('default shows landing', () => assert.deepEqual(parseEmbedParams(''), { embed: false, skipLanding: false, orbit: null }))
+t('?embed=1 skips landing', () => assert.equal(parseEmbedParams('?embed=1').skipLanding, true))
+t('bare ?embed works', () => assert.equal(parseEmbedParams('?embed').embed, true))
+t('?landing=0 skips landing only', () => { const o = parseEmbedParams('?landing=0'); assert.equal(o.skipLanding, true); assert.equal(o.embed, false) })
+t('?skip=1 skips landing', () => assert.equal(parseEmbedParams('?skip=1').skipLanding, true))
+t('?embed=1&landing=1 forces landing', () => assert.equal(parseEmbedParams('?embed=1&landing=1').skipLanding, false))
+t('?orbit= implies skip', () => { const o = parseEmbedParams('?orbit=npub1abc'); assert.equal(o.skipLanding, true); assert.equal(o.orbit, 'npub1abc') })
+t('relay params untouched', () => assert.equal(parseEmbedParams('?relay=nos.lol').skipLanding, false))
+
 console.log(failures ? `\n${failures} FAILED` : '\nall passed')
 process.exit(failures ? 1 : 0)

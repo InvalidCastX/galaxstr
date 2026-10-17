@@ -8,6 +8,30 @@ import { RelayPool, DEFAULT_RELAYS, resolveToHex, hexToNpub } from './nostr.js'
 import { buildGalaxy, detectConstellations } from './galaxy.js'
 import { LayoutClient } from './layoutClient.js'
 import { cleanRelays, relaysFromSearch, relaysToSearch, loadStoredRelays, saveStoredRelays } from './relays.js'
+import { parseEmbedParams } from './embed.js'
+
+// --- embedding ---
+// ?embed=1 / ?landing=0 skip the landing page; ?orbit=npub… opens that identity's orbit.
+const embedOpts = parseEmbedParams(typeof location !== 'undefined' ? location.search : '')
+const isEmbedded = embedOpts.embed
+const inFrame = (() => {
+  try {
+    return window.parent !== window
+  } catch {
+    return true
+  }
+})()
+// Tell a host page what happened, so it can react (open its own profile view, hide its spinner…).
+// Payloads are public data only (pubkeys), so the target origin is '*'.
+function notifyHost(type, detail = {}) {
+  if (!inFrame) return
+  try {
+    window.parent.postMessage({ source: 'galaxstr', type, ...detail }, '*')
+  } catch {
+    /* ignore */
+  }
+}
+let pendingOrbit = embedOpts.orbit
 
 // --- runtime configuration ---
 // Loaded from public/config.json at startup so relays, the NostrCard
@@ -92,6 +116,7 @@ async function loadConfig() {
     // nothing from the URL or a saved choice: use the deployment's defaults
     if (!urlRelays.length && !storedRelays.length) activeRelays.value = [...defaultRelays.value]
     syncUrl()
+    if (embedOpts.skipLanding) enterGalaxy()
   }
 }
 onMounted(loadConfig)
@@ -100,7 +125,7 @@ onMounted(loadConfig)
 // batches only load when the person asks for more — never one huge
 // up-front pull that hangs the tab while hundreds of accounts arrive.
 
-const screen = ref('landing') // 'landing' | 'galaxy'
+const screen = ref(embedOpts.skipLanding ? 'galaxy' : 'landing') // 'landing' | 'galaxy'
 const connection = reactive({ state: 'idle', lastUpdate: null, error: null }) // idle | connecting | connected | failed
 const loadedProfileCount = ref(0)
 const canLoadMore = computed(() => loadedProfileCount.value < config.maxProfiles && eventCount < config.maxEvents)
@@ -194,6 +219,11 @@ async function rebuild() {
     connection.lastUpdate = Date.now()
     loadedProfileCount.value = rawProfiles.size
     loadingMore.value = false
+    if (n.length && !readySent) {
+      readySent = true
+      notifyHost('ready', { stars: n.length })
+    }
+    tryPendingOrbit()
     // keep selection pointing at the freshest copy of the same node
     if (selectedNode.value) {
       const fresh = n.find((x) => x.id === selectedNode.value.id)
@@ -211,9 +241,28 @@ async function rebuild() {
 // Bumped whenever the data source changes so a layout that was already in
 // flight can't paint stale stars from the previous relays.
 let epoch = 0
+let readySent = false
+
+// ?orbit=… : keep trying after each rebuild until that identity shows up in the window
+// ("Load more stars" can bring it in). Typing in the orbit box cancels the auto-open.
+function tryPendingOrbit() {
+  if (!pendingOrbit) return
+  const hex = resolveToHex(pendingOrbit)
+  if (!hex) {
+    pendingOrbit = null
+    return
+  }
+  if (nodes.value.find((x) => x.id === hex)) {
+    pendingOrbit = null
+    orbitInput.value = ''
+    orbitPubkey.value = hex
+    focusOn(hex)
+  }
+}
 
 function resetAndReconnect() {
   epoch++
+  readySent = false
   pool?.closeAll()
   pool = null
   clearTimeout(rebuildTimer)
@@ -379,6 +428,7 @@ const lastUpdateLabel = computed(() => {
 
 function selectStar(node) {
   selectedNode.value = node
+  if (node) notifyHost('select', { pubkey: node.id, npub: hexToNpub(node.id) || null, name: node.name || null })
 }
 function closePopup() {
   selectedNode.value = null
@@ -447,6 +497,7 @@ const orbitFilteredEdges = computed(() => {
 })
 
 function enterOrbit() {
+  pendingOrbit = null
   orbitError.value = ''
   const hex = resolveToHex(orbitInput.value)
   if (!hex) {
@@ -532,7 +583,7 @@ function displayEdges() {
   <div v-else class="app">
     <header class="topbar">
       <div class="topbar__brand">
-        <span class="topbar__title">Galaxstr</span>
+        <span v-if="!isEmbedded" class="topbar__title">Galaxstr</span>
         <span class="topbar__status" :class="`status--${connection.state}`">
           <span class="dot"></span>
           <template v-if="connection.state === 'connected'">Connected</template>
