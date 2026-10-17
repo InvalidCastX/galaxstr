@@ -400,7 +400,7 @@ function displayEdges() {
     <div class="landing__grid">
       <div class="landing__content">
         <p class="landing__eyebrow">A telescope for the Nostr social universe</p>
-        <h1 class="landing__title">Nostr Galaxy</h1>
+        <h1 class="landing__title">Galaxstr</h1>
         <p class="landing__body">
           Every account becomes a star. Every reply, mention, and repost becomes a gravitational link between
           them. Explore the shape of the Nostr network as it actually forms — not as a feed.
@@ -448,7 +448,7 @@ function displayEdges() {
   <div v-else class="app">
     <header class="topbar">
       <div class="topbar__brand">
-        <span class="topbar__title">Nostr Galaxy</span>
+        <span class="topbar__title">Galaxstr</span>
         <span class="topbar__status" :class="`status--${connection.state}`">
           <span class="dot"></span>
           <template v-if="connection.state === 'connected'">Connected</template>

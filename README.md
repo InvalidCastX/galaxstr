@@ -1,6 +1,6 @@
-# Nostr Galaxy Map
+# Galaxstr
 
-A visual explorer of the Nostr / BCHNostr ecosystem. Users appear as glowing
+Galaxstr (formerly Nostr Galaxy Map) is a visual explorer of the Nostr / BCHNostr ecosystem. Users appear as glowing
 stars, observed interactions (replies, mentions, reposts, reactions, shared
 topics) appear as gravitational links, and loosely-connected groups surface
 as "possible" constellations.
@@ -39,54 +39,33 @@ npm run build      # production build in dist/
 npm run preview    # preview the production build locally
 ```
 
-## Deploying to GitHub Pages
+## Deploying to Cloudflare Pages (galaxstr.pages.dev)
 
-A ready-made workflow at `.github/workflows/deploy.yml` builds the app and
-publishes it automatically on every push to `main` — no third-party
-service involved, just GitHub itself.
+Cloudflare Pages builds straight from your Git repo on every push.
 
-1. **Push this project to a GitHub repo**, if you haven't already:
-   ```bash
-   cd nostr-galaxy-map
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/<your-repo>.git
-   git push -u origin main
-   ```
-   (Skip `git init`/`branch`/`remote` if it's already a git repo — just
-   commit and push.)
+1. Push this project to a GitHub (or GitLab) repo.
+2. In the Cloudflare dashboard: **Workers & Pages → Create → Pages →
+   Connect to Git**, pick the repo.
+3. Set the **Project name** to `galaxstr` — that is what makes the URL
+   `https://galaxstr.pages.dev`.
+4. Build settings:
+   - **Framework preset:** Vite (or None)
+   - **Build command:** `npm run build`
+   - **Build output directory:** `dist`
+   - **Environment variable:** `NODE_VERSION` = `20`
+5. **Save and Deploy.** Every later push to the production branch redeploys
+   automatically; other branches get preview URLs.
 
-2. **Turn on Pages, pointed at GitHub Actions:**
-   In your repo, go to **Settings → Pages**. Under "Build and deployment",
-   set **Source** to **GitHub Actions**. That's it — no branch to pick, no
-   folder to configure.
+Prefer the CLI? Build locally and upload `dist/`:
 
-3. **Push (or re-push) to `main`.** That push triggers the workflow: it
-   runs `npm ci && npm run build`, then publishes the `dist/` folder. Watch
-   it run under the **Actions** tab in your repo — it takes under a
-   minute. When it finishes, your **Settings → Pages** page shows the live
-   URL, typically:
-   ```
-   https://<your-username>.github.io/<your-repo>/
-   ```
+```bash
+npm run build
+npx wrangler pages deploy dist --project-name galaxstr
+```
 
-4. **Future updates** — just `git push` to `main` again; the workflow
-   rebuilds and redeploys automatically. You can also trigger it manually
-   from the Actions tab (`workflow_dispatch` is enabled).
-
-Nothing else needs changing for this to work: `vite.config.js` already
-sets `base: './'`, so the build's asset paths are relative and work
-correctly from a project subpath like `/<your-repo>/` — no repo-name-specific
-config needed.
-
-If you'd rather not use Actions, the manual alternative is: run
-`npm run build` locally, then publish the `dist/` folder to a `gh-pages`
-branch (the `gh-pages` npm package automates this: `npx gh-pages -d dist`
-after installing it as a dev dependency) — but the Actions workflow above
-does the same thing automatically on every push, so most people won't need
-this.
+`vite.config.js` sets `base: './'`, so asset paths work from the root domain
+with no extra config. `public/config.json` is served as a static file, so you
+can edit relays and limits in the deployed project without touching code.
 
 ## Lazy loading
 
