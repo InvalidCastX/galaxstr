@@ -191,5 +191,47 @@ t('turning avatars off cancels everything and requests nothing new', () => {
   console.log(`  info  JS-side cost of a frame with 1500 stars / 3000 links: ${((performance.now() - t0) / 50).toFixed(2)}ms (fake ctx; excludes browser raster)`)
 }
 
+// ---------- relays ----------
+console.log('relays.js')
+const R = await import('../src/relays.js')
+t('bare host -> wss://, trailing slash stripped, host lower-cased', () => {
+  assert.equal(R.parseRelay('Relay.Damus.io/').url, 'wss://relay.damus.io')
+  assert.equal(R.parseRelay('  wss://nos.lol  ').url, 'wss://nos.lol')
+  assert.equal(R.parseRelay('wss://relay.example.com/nostr/').url, 'wss://relay.example.com/nostr')
+})
+t('rejects junk, http, creds, insecure ws, bare words', () => {
+  for (const bad of ['', '   ', 'http://x.com', 'https://x.com', 'wss://u:p@x.com', 'ws://relay.example.com', 'hello', 'wss://']) {
+    assert.ok(R.parseRelay(bad).error, 'should reject: ' + JSON.stringify(bad))
+  }
+})
+t('localhost allows ws://', () => {
+  assert.equal(R.parseRelay('ws://localhost:7777').url, 'ws://localhost:7777')
+})
+t('cleanRelays de-dupes (incl. different spellings) and caps at MAX_RELAYS', () => {
+  assert.deepEqual(R.cleanRelays(['nos.lol', 'wss://nos.lol/', 'bad', 'relay.damus.io']), ['wss://nos.lol', 'wss://relay.damus.io'])
+  const many = Array.from({ length: 20 }, (_, i) => `r${i}.example.com`)
+  assert.equal(R.cleanRelays(many).length, R.MAX_RELAYS)
+})
+t('URL round-trip is short, readable, and keeps other params', () => {
+  const list = ['wss://relay.damus.io', 'wss://relay.bchnostr.com', 'ws://localhost:7777', 'wss://r.example.com/nostr']
+  const qs = R.relaysToSearch(list, '?foo=1&relay=old.example.com')
+  assert.equal(qs, '?foo=1&relay=relay.damus.io&relay=relay.bchnostr.com&relay=ws://localhost:7777&relay=r.example.com/nostr')
+  assert.deepEqual(R.relaysFromSearch(qs), list)
+})
+t('?relays=a,b comma form and empty search work', () => {
+  assert.deepEqual(R.relaysFromSearch('?relays=nos.lol,relay.damus.io'), ['wss://nos.lol', 'wss://relay.damus.io'])
+  assert.deepEqual(R.relaysFromSearch(''), [])
+  assert.equal(R.relaysToSearch([], '?foo=1'), '?foo=1')
+  assert.equal(R.relaysToSearch([], ''), '')
+})
+t('storage save/load/clear; broken storage never throws', () => {
+  const mem = new Map(); const st = { getItem: (k) => mem.get(k) ?? null, setItem: (k, v) => mem.set(k, v), removeItem: (k) => mem.delete(k) }
+  R.saveStoredRelays(st, ['wss://nos.lol']); assert.deepEqual(R.loadStoredRelays(st), ['wss://nos.lol'])
+  R.saveStoredRelays(st, null); assert.deepEqual(R.loadStoredRelays(st), [])
+  mem.set('galaxstr.relays', '{not json'); assert.deepEqual(R.loadStoredRelays(st), [])
+  const boom = { getItem() { throw new Error('x') }, setItem() { throw new Error('x') }, removeItem() { throw new Error('x') } }
+  R.saveStoredRelays(boom, ['wss://nos.lol']); assert.deepEqual(R.loadStoredRelays(boom), [])
+})
+
 console.log(failures ? `\n${failures} FAILED` : '\nall passed')
 process.exit(failures ? 1 : 0)

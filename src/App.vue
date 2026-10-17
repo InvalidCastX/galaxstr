@@ -3,9 +3,11 @@ import { ref, shallowRef, reactive, computed, onBeforeUnmount, onMounted, provid
 import GalaxyView from './components/GalaxyView.vue'
 import ProfilePopup from './components/ProfilePopup.vue'
 import SearchBox from './components/SearchBox.vue'
+import RelaySettings from './components/RelaySettings.vue'
 import { RelayPool, DEFAULT_RELAYS, resolveToHex, hexToNpub } from './nostr.js'
 import { buildGalaxy, detectConstellations } from './galaxy.js'
 import { LayoutClient } from './layoutClient.js'
+import { cleanRelays, relaysFromSearch, relaysToSearch, loadStoredRelays, saveStoredRelays } from './relays.js'
 
 // --- runtime configuration ---
 // Loaded from public/config.json at startup so relays, the NostrCard
@@ -25,6 +27,32 @@ const config = reactive({
   loadMoreStep: 120
 })
 const configLoaded = ref(false)
+
+// --- relay list ---
+// Precedence: ?relay= in the URL  >  the user's saved choice  >  config.json.
+// The active list is mirrored into the address bar so a link carries it.
+function safeStorage() {
+  try {
+    return window.localStorage
+  } catch {
+    return null
+  }
+}
+const urlRelays = typeof location !== 'undefined' ? relaysFromSearch(location.search) : []
+const storedRelays = urlRelays.length ? [] : loadStoredRelays(safeStorage())
+const activeRelays = ref(urlRelays.length ? urlRelays : storedRelays.length ? storedRelays : [...DEFAULT_RELAYS])
+const defaultRelays = ref([...DEFAULT_RELAYS])
+const relayStatus = ref({})
+const showSettings = ref(false)
+
+function syncUrl() {
+  try {
+    const search = relaysToSearch(activeRelays.value, location.search)
+    history.replaceState(history.state, '', location.pathname + search + location.hash)
+  } catch {
+    /* sandboxed iframe etc. — the setting still works, it just isn't in the URL */
+  }
+}
 
 const isCoarsePointer = typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches
 // Phones get a smaller star budget than desktops.
@@ -59,6 +87,11 @@ async function loadConfig() {
     // convenience config, never a hard dependency.
   } finally {
     configLoaded.value = true
+    const fromConfig = cleanRelays(config.relays)
+    defaultRelays.value = fromConfig.length ? fromConfig : [...DEFAULT_RELAYS]
+    // nothing from the URL or a saved choice: use the deployment's defaults
+    if (!urlRelays.length && !storedRelays.length) activeRelays.value = [...defaultRelays.value]
+    syncUrl()
   }
 }
 onMounted(loadConfig)
@@ -130,6 +163,7 @@ async function rebuild() {
     return
   }
   rebuilding = true
+  const myEpoch = epoch
   try {
     const { nodes: n, edges: e } = buildGalaxy(
       { profiles: rawProfiles, notes: rawNotes, reposts: rawReposts, reactions: rawReactions },
@@ -144,7 +178,7 @@ async function rebuild() {
       e.map((edge) => ({ source: edge.source, target: edge.target, weight: edge.weight })),
       positionCache
     )
-    if (disposed) return
+    if (disposed || myEpoch !== epoch) return
 
     const nextCache = new Map()
     for (let i = 0; i < n.length; i++) {
@@ -174,6 +208,49 @@ async function rebuild() {
   }
 }
 
+// Bumped whenever the data source changes so a layout that was already in
+// flight can't paint stale stars from the previous relays.
+let epoch = 0
+
+function resetAndReconnect() {
+  epoch++
+  pool?.closeAll()
+  pool = null
+  clearTimeout(rebuildTimer)
+  rebuildTimer = null
+  firstPendingAt = 0
+  rebuildQueued = false
+  rawProfiles.clear()
+  rawNotes.length = 0
+  rawReposts.length = 0
+  rawReactions.length = 0
+  eventCount = 0
+  oldestNoteSeen = null
+  oldestProfileSeen = null
+  positionCache = new Map()
+  nodes.value = []
+  edges.value = []
+  constellations.value = []
+  selectedNode.value = null
+  loadedProfileCount.value = 0
+  loadingMore.value = false
+  connection.lastUpdate = null
+  exitOrbit()
+  connectToRelays()
+}
+
+function applyRelays(list) {
+  showSettings.value = false
+  const next = cleanRelays(list)
+  if (!next.length) return
+  const changed = next.join('\n') !== activeRelays.value.join('\n')
+  activeRelays.value = next
+  // a list equal to the defaults needn't be "remembered" (lets future default changes through)
+  saveStoredRelays(safeStorage(), next.join('\n') === defaultRelays.value.join('\n') ? null : next)
+  syncUrl()
+  if (changed && connection.state !== 'idle') resetAndReconnect()
+}
+
 function enterGalaxy() {
   screen.value = 'galaxy'
   if (connection.state === 'idle') connectToRelays()
@@ -184,20 +261,23 @@ function enterGalaxy() {
 // event on the network for as long as the tab is open — each one parsed,
 // de-duplicated and (until the cap) triggering another rebuild.
 function snapshot(filter, onEvent) {
+  const p = pool // the pool this query belongs to; a later reconnect replaces `pool`
   const eoseFrom = new Set()
   let subId = null
   const stop = () => {
     clearTimeout(timer)
-    if (subId) pool?.close(subId)
+    if (subId) p.close(subId)
     subId = null
   }
   const timer = setTimeout(stop, 10000) // relays that never answer
-  subId = pool.subscribe([filter], {
-    onEvent,
+  subId = p.subscribe([filter], {
+    onEvent: (event) => {
+      if (pool === p) onEvent(event)
+    },
     onEose: (url) => {
       eoseFrom.add(url)
       // done once every open relay has answered and none is still connecting
-      if (pool && pool.allSettled && pool.openUrls.every((u) => eoseFrom.has(u))) stop()
+      if (p.allSettled && p.openUrls.every((u) => eoseFrom.has(u))) stop()
     }
   })
 }
@@ -240,8 +320,9 @@ function onReactionEvent(event) {
 function connectToRelays() {
   connection.state = 'connecting'
   connection.error = null
-  pool = new RelayPool(config.relays)
+  pool = new RelayPool([...activeRelays.value])
   pool.onStatusChange = (summary) => {
+    relayStatus.value = { ...summary }
     const values = Object.values(summary)
     if (values.some((s) => s === 'open')) connection.state = 'connected'
     else if (values.every((s) => s === 'closed' || s === 'error')) {
@@ -415,6 +496,9 @@ function displayEdges() {
           <li><i class="fa-solid fa-satellite-dish" aria-hidden="true"></i> Public relay data only</li>
           <li><i class="fa-solid fa-infinity" aria-hidden="true"></i> Free to explore, always</li>
         </ul>
+        <button class="landing__relays" @click="showSettings = true" aria-label="Relay settings">
+          <i class="fa-solid fa-gear" aria-hidden="true"></i> Relays ({{ activeRelays.length }})
+        </button>
       </div>
 
       <div class="landing__orbit" aria-hidden="true">
@@ -519,6 +603,9 @@ function displayEdges() {
       >
         {{ loadingMore ? 'Loading…' : 'Load more stars' }}
       </button>
+      <button class="constellation-toggle" @click="showSettings = true" title="Add or remove relays">
+        Relays ({{ activeRelays.length }})
+      </button>
       <button
         class="constellation-toggle"
         @click="cycleDataMode"
@@ -554,6 +641,15 @@ function displayEdges() {
       <ProfilePopup :node="selectedNode" :nostr-card-base-url="config.nostrCardBaseUrl" @close="closePopup" />
     </div>
   </div>
+
+  <RelaySettings
+    v-if="showSettings"
+    :relays="activeRelays"
+    :defaults="defaultRelays"
+    :status="relayStatus"
+    @apply="applyRelays"
+    @close="showSettings = false"
+  />
 </template>
 
 <style scoped>
@@ -612,6 +708,21 @@ function displayEdges() {
   font-size: 15.5px;
   max-width: 42ch;
   margin: 0 auto 32px;
+}
+.landing__relays {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--bg-panel);
+  border: 1px solid var(--hairline);
+  color: var(--dim);
+  border-radius: 999px;
+  padding: 7px 13px;
+  font-size: 12px;
+  margin-top: 20px;
+}
+.landing__relays:hover {
+  color: var(--star-white);
 }
 .landing__cta {
   display: inline-flex;

@@ -67,6 +67,26 @@ npx wrangler pages deploy dist --project-name galaxstr
 with no extra config. `public/config.json` is served as a static file, so you
 can edit relays and limits in the deployed project without touching code.
 
+## Relay settings
+
+Click **Relays (n)** (on the landing page or in the bottom bar) to add or
+remove relays. Edit the list, then **Apply & reload** — the galaxy reloads
+from the new relays. Each row shows a live connection status, **Reset to
+defaults** restores the list from `config.json`, and **Copy share link** gives
+you a URL that opens with the same relays.
+
+The active relays are always mirrored in the address bar:
+
+```
+https://galaxstr.pages.dev/?relay=relay.damus.io&relay=nos.lol
+```
+
+(`wss://` is implied; `ws://` is accepted for `localhost` only.) A
+`?relays=a,b` comma form is also read. At startup the order of precedence is
+**URL → your saved choice (localStorage) → `config.json`**. A link only
+overrides the relays for that visit; your saved list changes only when you
+press Apply. Limits: 1–8 relays, `wss://` only (except localhost).
+
 ## Lazy loading
 
 The first load pulls a small batch (120 profiles, a few hundred recent
@@ -186,13 +206,15 @@ src/
   layout.js            force layout (pure; runs in the worker)
   layout.worker.js     Web Worker entry for layout.js
   layoutClient.js      promise wrapper + main-thread fallback
+  relays.js            relay validation, URL (?relay=) + localStorage
   renderer.js          canvas drawing, camera, hit-testing, avatar cache
   components/
     GalaxyView.vue      canvas host: pointer gestures (pan/pinch/twist/tap)
     ProfilePopup.vue     mini NostrCard preview + link to the full card
     SearchBox.vue        search by name / npub / nprofile / NIP-05
+    RelaySettings.vue    add/remove relays modal
 public/
-  config.json          relays, NostrCard domain, load limits — edit without a rebuild
+  config.json          default relays, NostrCard domain, load limits — edit without a rebuild
 ```
 
 ## Not included in this MVP
