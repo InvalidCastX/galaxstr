@@ -1,10 +1,11 @@
 <script setup>
-import { ref, reactive, computed, onBeforeUnmount, onMounted, provide } from 'vue'
+import { ref, shallowRef, reactive, computed, onBeforeUnmount, onMounted, provide } from 'vue'
 import GalaxyView from './components/GalaxyView.vue'
 import ProfilePopup from './components/ProfilePopup.vue'
 import SearchBox from './components/SearchBox.vue'
 import { RelayPool, DEFAULT_RELAYS, resolveToHex, hexToNpub } from './nostr.js'
-import { buildGalaxy, layoutGalaxy, detectConstellations } from './galaxy.js'
+import { buildGalaxy, detectConstellations } from './galaxy.js'
+import { LayoutClient } from './layoutClient.js'
 
 // --- runtime configuration ---
 // Loaded from public/config.json at startup so relays, the NostrCard
@@ -16,6 +17,7 @@ const config = reactive({
   nostrCardBaseUrl: 'https://nostrcard.vercel.app/#/p/',
   maxProfiles: 500,
   maxEvents: 5000,
+  maxNodes: 1200,
   initialProfileLimit: 120,
   initialNoteLimit: 400,
   initialRepostLimit: 150,
@@ -23,6 +25,10 @@ const config = reactive({
   loadMoreStep: 120
 })
 const configLoaded = ref(false)
+
+const isCoarsePointer = typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches
+// Phones get a smaller star budget than desktops.
+const effectiveMaxNodes = () => (isCoarsePointer ? Math.min(config.maxNodes, 600) : config.maxNodes)
 
 // --- avatar data mode ---
 // 'saver' (default) fetches small resized avatars; 'full' loads original
@@ -73,13 +79,18 @@ const rawReposts = []
 const rawReactions = []
 let eventCount = 0
 let oldestNoteSeen = null // for paging "load more" further back in time
-let positionCache = new Map() // id -> {x, y, vx, vy} — carried across rebuilds so existing stars don't get re-simulated from scratch on every batch
+let oldestProfileSeen = null
+let positionCache = new Map() // id -> {x, y} — carried across rebuilds so settled stars stay put
 
-const nodes = ref([])
-const edges = ref([])
-const constellations = ref([])
+// shallowRef: these hold thousands of plain objects that are only ever
+// replaced wholesale. A deep ref() would wrap every node (and its Maps) and
+// every edge in a reactive Proxy, making each property read in the render
+// path far slower for no benefit.
+const nodes = shallowRef([])
+const edges = shallowRef([])
+const constellations = shallowRef([])
 
-const selectedNode = ref(null)
+const selectedNode = shallowRef(null)
 const focusToken = reactive({ id: null, nonce: 0 })
 const orbitPubkey = ref(null)
 const orbitInput = ref('')
@@ -87,48 +98,143 @@ const orbitError = ref('')
 const showConstellations = ref(false)
 
 let pool = null
+let layoutClient = null
+let disposed = false
+
+// --- rebuild scheduling ---
+// Trailing debounce (so a burst of events becomes one rebuild) with a max
+// wait (so a steady trickle can't postpone the first render forever), and
+// never more than one rebuild in flight.
 let rebuildTimer = null
+let firstPendingAt = 0
+let rebuilding = false
+let rebuildQueued = false
 
 function scheduleRebuild() {
-  if (rebuildTimer) return
-  // A slightly longer debounce than a single event burst, so a fast stream
-  // of incoming events collapses into one layout pass instead of many.
+  const now = performance.now()
+  if (!firstPendingAt) firstPendingAt = now
+  clearTimeout(rebuildTimer)
+  const base = nodes.value.length ? 900 : 500
+  const wait = Math.max(0, Math.min(base, firstPendingAt + 3000 - now))
   rebuildTimer = setTimeout(() => {
     rebuildTimer = null
+    firstPendingAt = 0
     rebuild()
-  }, 1200)
+  }, wait)
 }
 
-function rebuild() {
-  const { nodes: n, edges: e } = buildGalaxy({
-    profiles: rawProfiles,
-    notes: rawNotes,
-    reposts: rawReposts,
-    reactions: rawReactions
-  })
-  const laidOut = layoutGalaxy(n, e, { width: 2200, height: 1600, previous: positionCache })
+async function rebuild() {
+  if (disposed) return
+  if (rebuilding) {
+    rebuildQueued = true
+    return
+  }
+  rebuilding = true
+  try {
+    const { nodes: n, edges: e } = buildGalaxy(
+      { profiles: rawProfiles, notes: rawNotes, reposts: rawReposts, reactions: rawReactions },
+      { maxNodes: effectiveMaxNodes() }
+    )
 
-  // Warm cache for next time: only positions, not the whole node payload.
-  const nextCache = new Map()
-  for (const node of laidOut) nextCache.set(node.id, { x: node.x, y: node.y, vx: node.vx, vy: node.vy })
-  positionCache = nextCache
+    // Layout runs in a Web Worker: only ids/activity/links go over, a flat
+    // Float32Array of positions comes back. The UI stays interactive.
+    layoutClient = layoutClient || new LayoutClient()
+    const xy = await layoutClient.run(
+      n.map((node) => ({ id: node.id, activity: node.activity })),
+      e.map((edge) => ({ source: edge.source, target: edge.target, weight: edge.weight })),
+      positionCache
+    )
+    if (disposed) return
 
-  nodes.value = laidOut
-  edges.value = e
-  constellations.value = detectConstellations(laidOut, e)
-  connection.lastUpdate = Date.now()
-  loadedProfileCount.value = rawProfiles.size
-  loadingMore.value = false
-  // keep selection pointing at the freshest copy of the same node
-  if (selectedNode.value) {
-    const fresh = laidOut.find((x) => x.id === selectedNode.value.id)
-    if (fresh) selectedNode.value = fresh
+    const nextCache = new Map()
+    for (let i = 0; i < n.length; i++) {
+      n[i].x = xy[i * 2]
+      n[i].y = xy[i * 2 + 1]
+      nextCache.set(n[i].id, { x: n[i].x, y: n[i].y })
+    }
+    positionCache = nextCache
+
+    nodes.value = n
+    edges.value = e
+    constellations.value = detectConstellations(n, e)
+    connection.lastUpdate = Date.now()
+    loadedProfileCount.value = rawProfiles.size
+    loadingMore.value = false
+    // keep selection pointing at the freshest copy of the same node
+    if (selectedNode.value) {
+      const fresh = n.find((x) => x.id === selectedNode.value.id)
+      if (fresh) selectedNode.value = fresh
+    }
+  } finally {
+    rebuilding = false
+    if (rebuildQueued) {
+      rebuildQueued = false
+      scheduleRebuild()
+    }
   }
 }
 
 function enterGalaxy() {
   screen.value = 'galaxy'
   if (connection.state === 'idle') connectToRelays()
+}
+
+// A "snapshot" subscription: fetch the stored events matching a filter and
+// then CLOSE it. Without this, relays keep streaming every new kind 1/7
+// event on the network for as long as the tab is open — each one parsed,
+// de-duplicated and (until the cap) triggering another rebuild.
+function snapshot(filter, onEvent) {
+  const eoseFrom = new Set()
+  let subId = null
+  const stop = () => {
+    clearTimeout(timer)
+    if (subId) pool?.close(subId)
+    subId = null
+  }
+  const timer = setTimeout(stop, 10000) // relays that never answer
+  subId = pool.subscribe([filter], {
+    onEvent,
+    onEose: (url) => {
+      eoseFrom.add(url)
+      // done once every open relay has answered and none is still connecting
+      if (pool && pool.allSettled && pool.openUrls.every((u) => eoseFrom.has(u))) stop()
+    }
+  })
+}
+
+function accepting() {
+  return eventCount < config.maxEvents
+}
+function countEvent() {
+  eventCount++
+  if (eventCount >= config.maxEvents) pool?.closeSubs() // hard stop: nothing more can be used
+  scheduleRebuild()
+}
+
+function onProfileEvent(event) {
+  if (!accepting()) return
+  const existing = rawProfiles.get(event.pubkey)
+  if (!existing || existing.created_at < event.created_at) {
+    rawProfiles.set(event.pubkey, event)
+    oldestProfileSeen = oldestProfileSeen ? Math.min(oldestProfileSeen, event.created_at) : event.created_at
+    countEvent()
+  }
+}
+function onNoteEvent(event) {
+  if (!accepting()) return
+  rawNotes.push(event)
+  oldestNoteSeen = oldestNoteSeen ? Math.min(oldestNoteSeen, event.created_at) : event.created_at
+  countEvent()
+}
+function onRepostEvent(event) {
+  if (!accepting()) return
+  rawReposts.push(event)
+  countEvent()
+}
+function onReactionEvent(event) {
+  if (!accepting()) return
+  rawReactions.push(event)
+  countEvent()
 }
 
 function connectToRelays() {
@@ -147,45 +253,10 @@ function connectToRelays() {
 
   // First pass: a small, fast batch so the galaxy renders quickly.
   // Larger batches are only pulled in later, on request (see loadMore()).
-  pool.subscribe([{ kinds: [0], limit: config.initialProfileLimit }], {
-    onEvent: (event) => {
-      if (eventCount > config.maxEvents) return
-      const existing = rawProfiles.get(event.pubkey)
-      if (!existing || existing.created_at < event.created_at) {
-        rawProfiles.set(event.pubkey, event)
-        eventCount++
-        scheduleRebuild()
-      }
-    }
-  })
-
-  pool.subscribe([{ kinds: [1], limit: config.initialNoteLimit }], {
-    onEvent: (event) => {
-      if (eventCount > config.maxEvents) return
-      rawNotes.push(event)
-      oldestNoteSeen = oldestNoteSeen ? Math.min(oldestNoteSeen, event.created_at) : event.created_at
-      eventCount++
-      scheduleRebuild()
-    }
-  })
-
-  pool.subscribe([{ kinds: [6], limit: config.initialRepostLimit }], {
-    onEvent: (event) => {
-      if (eventCount > config.maxEvents) return
-      rawReposts.push(event)
-      eventCount++
-      scheduleRebuild()
-    }
-  })
-
-  pool.subscribe([{ kinds: [7], limit: config.initialReactionLimit }], {
-    onEvent: (event) => {
-      if (eventCount > config.maxEvents) return
-      rawReactions.push(event)
-      eventCount++
-      scheduleRebuild()
-    }
-  })
+  snapshot({ kinds: [0], limit: config.initialProfileLimit }, onProfileEvent)
+  snapshot({ kinds: [1], limit: config.initialNoteLimit }, onNoteEvent)
+  snapshot({ kinds: [6], limit: config.initialRepostLimit }, onRepostEvent)
+  snapshot({ kinds: [7], limit: config.initialReactionLimit }, onReactionEvent)
 }
 
 // Pulls in the next slice of the universe — older profiles and notes —
@@ -196,40 +267,25 @@ function loadMore() {
   if (!pool || loadingMore.value || !canLoadMore.value) return
   loadingMore.value = true
 
-  const profileSub = pool.subscribe([{ kinds: [0], limit: config.loadMoreStep }], {
-    onEvent: (event) => {
-      if (eventCount > config.maxEvents) return
-      const existing = rawProfiles.get(event.pubkey)
-      if (!existing || existing.created_at < event.created_at) {
-        rawProfiles.set(event.pubkey, event)
-        eventCount++
-        scheduleRebuild()
-      }
-    },
-    onEose: () => pool?.close(profileSub)
-  })
+  // Both slices are paged backwards with `until`; the profile one used to
+  // re-request the same newest 120 profiles every time.
+  const profileFilter = { kinds: [0], limit: config.loadMoreStep }
+  if (oldestProfileSeen) profileFilter.until = oldestProfileSeen - 1
+  snapshot(profileFilter, onProfileEvent)
 
-  const noteFilter = oldestNoteSeen
-    ? { kinds: [1], limit: config.loadMoreStep, until: oldestNoteSeen - 1 }
-    : { kinds: [1], limit: config.loadMoreStep }
-  const noteSub = pool.subscribe([noteFilter], {
-    onEvent: (event) => {
-      if (eventCount > config.maxEvents) return
-      rawNotes.push(event)
-      oldestNoteSeen = oldestNoteSeen ? Math.min(oldestNoteSeen, event.created_at) : event.created_at
-      eventCount++
-      scheduleRebuild()
-    },
-    onEose: () => pool?.close(noteSub)
-  })
+  const noteFilter = { kinds: [1], limit: config.loadMoreStep }
+  if (oldestNoteSeen) noteFilter.until = oldestNoteSeen - 1
+  snapshot(noteFilter, onNoteEvent)
 
   // Safety net: stop showing "loading" even if a relay never sends EOSE.
   setTimeout(() => (loadingMore.value = false), 6000)
 }
 
 onBeforeUnmount(() => {
+  disposed = true
   pool?.closeAll()
-  if (rebuildTimer) clearTimeout(rebuildTimer)
+  layoutClient?.destroy()
+  clearTimeout(rebuildTimer)
 })
 
 const lastUpdateLabel = computed(() => {

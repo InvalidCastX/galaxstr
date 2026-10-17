@@ -7,6 +7,7 @@
   "nostrCardBaseUrl": "https://nostrcard.vercel.app/#/p/",
   "maxProfiles": 500,
   "maxEvents": 5000,
+  "maxNodes": 1200,
   "initialProfileLimit": 120,
   "initialNoteLimit": 400,
   "initialRepostLimit": 150,

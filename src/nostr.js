@@ -27,8 +27,7 @@ export class RelayPool {
     this.relayUrls = relayUrls
     this.sockets = new Map() // url -> WebSocket
     this.status = new Map() // url -> 'connecting' | 'open' | 'closed' | 'error'
-    this.subs = new Map() // subId -> { filters, onEvent, onEose, seenEose: Set, closed }
-    this.seenEventIds = new Set()
+    this.subs = new Map() // subId -> { filters, onEvent, onEose, seen: Set, closed }
     this.onStatusChange = null
   }
 
@@ -93,10 +92,11 @@ export class RelayPool {
     if (!event || !event.id) return
     const sub = this.subs.get(subId)
     if (!sub) return
-    // Global de-dup: the same event often arrives from multiple relays.
-    const key = subId + ':' + event.id
-    if (this.seenEventIds.has(key)) return
-    this.seenEventIds.add(key)
+    // De-dup per subscription: the same event often arrives from several
+    // relays. The set lives on the sub, so it is freed when the sub closes
+    // (a single global set would grow for as long as the tab is open).
+    if (sub.seen.has(event.id)) return
+    sub.seen.add(event.id)
     sub.onEvent(event)
   }
 
@@ -121,7 +121,7 @@ export class RelayPool {
    */
   subscribe(filters, { onEvent, onEose } = {}) {
     const subId = randId()
-    this.subs.set(subId, { filters, onEvent: onEvent || (() => {}), onEose, closed: false })
+    this.subs.set(subId, { filters, onEvent: onEvent || (() => {}), onEose, seen: new Set(), closed: false })
     for (const [url, ws] of this.sockets) {
       if (this.status.get(url) === 'open') this._send(ws, ['REQ', subId, ...filters])
     }
@@ -134,6 +134,21 @@ export class RelayPool {
     sub.closed = true
     for (const [, ws] of this.sockets) this._send(ws, ['CLOSE', subId])
     this.subs.delete(subId)
+  }
+
+  /** Stops every subscription but keeps the sockets open (for later REQs). */
+  closeSubs() {
+    for (const subId of [...this.subs.keys()]) this.close(subId)
+  }
+
+  /** True once no relay is still mid-handshake. */
+  get allSettled() {
+    return this.relayUrls.every((u) => this.status.get(u) !== 'connecting' && this.status.has(u))
+  }
+
+  /** Number of relays currently open. */
+  get openUrls() {
+    return this.relayUrls.filter((u) => this.status.get(u) === 'open')
   }
 
   closeAll() {

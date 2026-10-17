@@ -1,6 +1,7 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
-import StarNode from './StarNode.vue'
+import { ref, computed, inject, watch, onMounted, onBeforeUnmount } from 'vue'
+import { GalaxyRenderer } from '../renderer.js'
+import { avatarThumb } from '../image.js'
 
 const props = defineProps({
   nodes: { type: Array, default: () => [] },
@@ -11,322 +12,213 @@ const props = defineProps({
 const emit = defineEmits(['select-star', 'background-click'])
 
 const viewportEl = ref(null)
-const view = reactive({ x: 0, y: 0, scale: 0.55, rotation: 0 })
-const viewportSize = reactive({ width: 0, height: 0 })
-const dragging = ref(false)
-let dragStart = null
-let pinchStart = null
+const canvasEl = ref(null)
+const rotationDeg = ref(0) // only used to turn the compass needle
 
-// Coarse-pointer (touch) devices get fewer, cheaper stars — phones have far
-// less GPU/CPU headroom than a laptop for 260 live DOM elements with blur
-// glows, and this is the primary surface, so it needs its own budget.
-const isCoarsePointer = typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)').matches
+// 'off' skips avatars entirely, 'saver' fetches a small resized version,
+// 'full' loads the original. Provided from App.vue.
+const dataMode = inject('dataMode', computed(() => 'saver'))
 
-// --- RAF-batched view updates ---
-// touchmove fires far more often than the screen can repaint (sometimes
-// 100+ times/sec). Writing straight into the reactive `view` on every event
-// forced a full culledNodes recompute (an O(n) loop with trig) that often —
-// this is what made panning feel laggy/sticky on a phone. Collapsing every
-// pending change into a single requestAnimationFrame callback caps the
-// recompute rate to the display's actual refresh rate.
-let rafId = null
-const pendingView = { x: null, y: null, scale: null, rotation: null }
-function flushPendingView() {
-  rafId = null
-  if (pendingView.x !== null) view.x = pendingView.x
-  if (pendingView.y !== null) view.y = pendingView.y
-  if (pendingView.scale !== null) view.scale = pendingView.scale
-  if (pendingView.rotation !== null) view.rotation = pendingView.rotation
-  pendingView.x = pendingView.y = pendingView.scale = pendingView.rotation = null
-}
-function queueViewUpdate(patch) {
-  Object.assign(pendingView, patch)
-  if (rafId === null) rafId = requestAnimationFrame(flushPendingView)
+const isCoarsePointer = typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches
+
+// The whole galaxy is drawn on one <canvas> by GalaxyRenderer (see
+// renderer.js). The camera lives in plain (non-reactive) state there, so
+// panning/zooming never goes through Vue's reactivity or a vdom diff — it
+// just schedules one canvas repaint per animation frame.
+let renderer = null
+let resizeObserver = null
+
+function avatarUrlFor(picture) {
+  if (!picture || dataMode.value === 'off') return null
+  return dataMode.value === 'full' ? picture : avatarThumb(picture, 64)
 }
 
-const nodeById = computed(() => new Map(props.nodes.map((n) => [n.id, n])))
+// --- pointer gestures (mouse + touch + pen through one code path) ---
+const pointers = new Map() // pointerId -> { x, y } in canvas CSS px
+let gesture = null // { type: 'pan' | 'pinch', ... }
+const TAP_SLOP = 6
 
-// --- viewport culling ---
-// Rendering every star as DOM (avatar + glow + label) is what actually
-// hangs the tab once a few hundred accounts are loaded — not the data
-// fetch itself. So only mount stars that are within (or just outside)
-// the visible viewport; panning/zooming re-derives this cheaply.
-const CULL_MARGIN = 240 // screen px of slack around the viewport edge
-const MAX_RENDERED_STARS = isCoarsePointer ? 150 : 260 // lower ceiling on touch devices
+function localPoint(e) {
+  const rect = canvasEl.value.getBoundingClientRect()
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top }
+}
 
-// Sticky set from the previous computation — lets the margin trim below
-// prefer stars it already rendered, instead of re-litigating the ranking
-// from scratch every time a star drifts a pixel across a boundary.
-const previouslyRendered = new Set()
-
-const culledNodes = computed(() => {
-  const w = viewportSize.width || 1
-  const h = viewportSize.height || 1
-  const rad = (view.rotation * Math.PI) / 180
-  const cos = Math.cos(rad)
-  const sin = Math.sin(rad)
-
-  // Split into "actually on screen" vs "just in the off-screen slack".
-  // This distinction matters: the activity cap below must never evict a
-  // star that's plainly visible just because something else scrolled
-  // into the margin and outranked it — that's what caused stars to blink
-  // out and back in while panning, with no relation to their own motion.
-  const strictlyVisible = []
-  const marginOnly = []
-  for (const n of props.nodes) {
-    const lx = n.x * view.scale
-    const ly = n.y * view.scale
-    const sx = view.x + (lx * cos - ly * sin)
-    const sy = view.y + (lx * sin + ly * cos)
-    if (sx >= 0 && sx <= w && sy >= 0 && sy <= h) {
-      strictlyVisible.push(n)
-    } else if (sx >= -CULL_MARGIN && sx <= w + CULL_MARGIN && sy >= -CULL_MARGIN && sy <= h + CULL_MARGIN) {
-      marginOnly.push(n)
-    }
+function beginPinch() {
+  const [a, b] = [...pointers.values()]
+  const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+  gesture = {
+    type: 'pinch',
+    d0: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+    angle0: Math.atan2(b.y - a.y, b.x - a.x),
+    scale0: renderer.view.scale,
+    rotation0: renderer.view.rotation,
+    anchor: renderer.screenToWorld(mid.x, mid.y) // world point that stays under the fingers
   }
-
-  // Always keep the selected/focused star mounted even if it drifted
-  // off-screen, so the popup and camera focus never lose their target.
-  // These are appended after the cap below, so they can never be sorted
-  // out the way they previously could be.
-  const mustKeepIds = [props.selectedId, props.focusToken?.id].filter(Boolean)
-  const shownIds = new Set([...strictlyVisible, ...marginOnly].map((n) => n.id))
-  const mustKeepNodes = []
-  for (const id of mustKeepIds) {
-    if (!shownIds.has(id)) {
-      const n = nodeById.value.get(id)
-      if (n) mustKeepNodes.push(n)
-    }
-  }
-
-  // The activity cap only ever trims the off-screen margin buffer, never
-  // what's strictly visible — so a comfortably on-screen star can no
-  // longer vanish because of arrivals elsewhere.
-  const budget = Math.max(0, MAX_RENDERED_STARS - strictlyVisible.length - mustKeepNodes.length)
-  let marginKept = marginOnly
-  if (marginOnly.length > budget) {
-    marginKept = [...marginOnly]
-      .sort((a, b) => {
-        // Prefer whatever was already rendered a moment ago, so a star
-        // sitting right at the margin boundary doesn't rapidly toggle
-        // in and out as the viewport shifts by a pixel at a time.
-        const aSticky = previouslyRendered.has(a.id) ? 1 : 0
-        const bSticky = previouslyRendered.has(b.id) ? 1 : 0
-        if (aSticky !== bSticky) return bSticky - aSticky
-        return (b.activity || 0) - (a.activity || 0)
-      })
-      .slice(0, budget)
-  }
-
-  const result = [...strictlyVisible, ...marginKept, ...mustKeepNodes]
-  previouslyRendered.clear()
-  for (const n of result) previouslyRendered.add(n.id)
-  return result
-})
-
-const culledIds = computed(() => new Set(culledNodes.value.map((n) => n.id)))
-
-const visibleEdges = computed(() =>
-  props.edges.filter((e) => {
-    const s = e.source?.id || e.source
-    const t = e.target?.id || e.target
-    return culledIds.value.has(s) && culledIds.value.has(t)
-  })
-)
-
-function updateViewportSize() {
-  if (!viewportEl.value) return
-  const rect = viewportEl.value.getBoundingClientRect()
-  viewportSize.width = rect.width
-  viewportSize.height = rect.height
 }
 
-function nodeXY(idOrNode) {
-  const n = typeof idOrNode === 'object' ? idOrNode : nodeById.value.get(idOrNode)
-  return n ? { x: n.x, y: n.y } : { x: 0, y: 0 }
-}
-
-function edgeStyle(edge) {
-  const w = edge.strength === 'strong' ? 2 : edge.strength === 'medium' ? 1.2 : 0.6
-  const o = edge.strength === 'strong' ? 0.55 : edge.strength === 'medium' ? 0.32 : 0.16
-  return { width: w, opacity: o }
-}
-
-function radiusFor(node) {
-  // Slightly larger than the old sizing — bigger comfortable tap targets
-  // on mobile, and matched to the wider collision spacing in galaxy.js
-  // so visual size and actual spacing stay consistent.
-  return 13 + Math.sqrt(1 + (node.activity || 0)) * 3.8
-}
-
-// --- pan / zoom (mouse + touch) ---
 function onPointerDown(e) {
-  if (e.target.closest('.star')) return
-  dragging.value = true
-  dragStart = { x: e.clientX - view.x, y: e.clientY - view.y }
+  if (!renderer || (e.pointerType === 'mouse' && e.button !== 0)) return
+  canvasEl.value.setPointerCapture?.(e.pointerId)
+  pointers.set(e.pointerId, localPoint(e))
+  if (pointers.size === 1) {
+    const p = pointers.get(e.pointerId)
+    gesture = { type: 'pan', startX: p.x, startY: p.y, lastX: p.x, lastY: p.y, moved: false }
+  } else if (pointers.size === 2) {
+    beginPinch()
+  }
 }
+
 function onPointerMove(e) {
-  if (!dragging.value || !dragStart) return
-  queueViewUpdate({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y })
+  if (!renderer || !pointers.has(e.pointerId) || !gesture) return
+  const p = localPoint(e)
+  pointers.set(e.pointerId, p)
+  if (gesture.type === 'pan' && pointers.size === 1) {
+    if (!gesture.moved && Math.hypot(p.x - gesture.startX, p.y - gesture.startY) > TAP_SLOP) gesture.moved = true
+    if (gesture.moved) {
+      renderer.panBy(p.x - gesture.lastX, p.y - gesture.lastY)
+      gesture.lastX = p.x
+      gesture.lastY = p.y
+    }
+  } else if (gesture.type === 'pinch' && pointers.size >= 2) {
+    const [a, b] = [...pointers.values()]
+    const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+    const d = Math.hypot(a.x - b.x, a.y - b.y)
+    const angle = Math.atan2(b.y - a.y, b.x - a.x)
+    const deltaDeg = ((angle - gesture.angle0) * 180) / Math.PI
+    // Keep the world point that started under the fingers under their
+    // midpoint: pinch-zoom, twist-rotate and two-finger pan in one move.
+    renderer.placeWorldAt(
+      gesture.anchor.x,
+      gesture.anchor.y,
+      mid.x,
+      mid.y,
+      gesture.scale0 * (d / gesture.d0),
+      gesture.rotation0 + deltaDeg
+    )
+  }
 }
-function onPointerUp() {
-  dragging.value = false
-  dragStart = null
+
+function endPointer(e, cancelled) {
+  if (!pointers.has(e.pointerId)) return
+  const p = pointers.get(e.pointerId)
+  pointers.delete(e.pointerId)
+  canvasEl.value?.releasePointerCapture?.(e.pointerId)
+
+  if (gesture?.type === 'pan' && !gesture.moved && !cancelled && pointers.size === 0 && renderer) {
+    // A tap, not a drag: select the star under the finger, or dismiss.
+    const hit = renderer.hitTest(p.x, p.y)
+    if (hit) emit('select-star', hit)
+    else emit('background-click')
+  }
+
+  if (pointers.size === 0) {
+    gesture = null
+  } else if (pointers.size === 1) {
+    // Went from two fingers to one: continue as a pan from where it is now.
+    const rest = [...pointers.values()][0]
+    gesture = { type: 'pan', startX: rest.x, startY: rest.y, lastX: rest.x, lastY: rest.y, moved: true }
+  } else {
+    beginPinch()
+  }
 }
+
 function onWheel(e) {
+  if (!renderer) return
   e.preventDefault()
+  const p = localPoint(e)
   if (e.shiftKey) {
-    // Desktop rotate: shift+scroll turns the map (touch users get the
-    // two-finger twist gesture instead — see onTouchMove).
-    view.rotation += e.deltaY * 0.15
+    // Desktop rotate: shift+scroll turns the map around the cursor.
+    renderer.transformAround(p.x, p.y, renderer.view.scale, renderer.view.rotation + e.deltaY * 0.15)
     return
   }
   const delta = -e.deltaY * 0.0012
-  zoomAt(e.clientX, e.clientY, delta)
+  renderer.transformAround(p.x, p.y, renderer.view.scale * (1 + delta), renderer.view.rotation)
 }
-function zoomAt(clientX, clientY, delta) {
+
+function resetRotation() {
+  if (!renderer) return
+  renderer.transformAround(renderer.w / 2, renderer.h / 2, renderer.view.scale, 0)
+}
+
+function syncSize() {
+  if (!renderer || !viewportEl.value) return
   const rect = viewportEl.value.getBoundingClientRect()
-  const cx = clientX - rect.left
-  const cy = clientY - rect.top
-  const newScale = Math.min(3, Math.max(0.12, view.scale * (1 + delta)))
-  const ratio = newScale / view.scale
-  view.x = cx - (cx - view.x) * ratio
-  view.y = cy - (cy - view.y) * ratio
-  view.scale = newScale
+  renderer.resize(rect.width, rect.height, window.devicePixelRatio || 1)
 }
 
-function dist(t0, t1) {
-  return Math.hypot(t0.clientX - t1.clientX, t0.clientY - t1.clientY)
-}
-function angleOf(t0, t1) {
-  return Math.atan2(t1.clientY - t0.clientY, t1.clientX - t0.clientX)
-}
-function onTouchStart(e) {
-  if (e.touches.length === 1) {
-    if (e.target.closest('.star')) return
-    dragging.value = true
-    dragStart = { x: e.touches[0].clientX - view.x, y: e.touches[0].clientY - view.y }
-  } else if (e.touches.length === 2) {
-    dragging.value = false
-    pinchStart = {
-      d: dist(e.touches[0], e.touches[1]),
-      scale: view.scale,
-      angle: angleOf(e.touches[0], e.touches[1]),
-      rotation: view.rotation
-    }
+onMounted(() => {
+  renderer = new GalaxyRenderer(canvasEl.value, {
+    coarse: isCoarsePointer,
+    avatarUrlFor,
+    onRotationChange: (deg) => (rotationDeg.value = deg)
+  })
+  syncSize()
+  // start with the world origin in the middle of the screen
+  renderer.placeWorldAt(0, 0, renderer.w / 2, renderer.h / 2, renderer.view.scale, 0)
+  renderer.setAvatarsEnabled(dataMode.value !== 'off')
+  renderer.setData(props.nodes, props.edges)
+  renderer.setSelected(props.selectedId)
+
+  // wheel must be non-passive so preventDefault() can stop page scroll/zoom
+  canvasEl.value.addEventListener('wheel', onWheel, { passive: false })
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(syncSize)
+    resizeObserver.observe(viewportEl.value)
+  } else {
+    window.addEventListener('resize', syncSize)
   }
-}
-function onTouchMove(e) {
-  if (e.touches.length === 1 && dragging.value && dragStart) {
-    queueViewUpdate({ x: e.touches[0].clientX - dragStart.x, y: e.touches[0].clientY - dragStart.y })
-  } else if (e.touches.length === 2 && pinchStart) {
-    e.preventDefault()
-    const d = dist(e.touches[0], e.touches[1])
-    const factor = d / pinchStart.d
-    const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2
-    const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2
-    const rect = viewportEl.value.getBoundingClientRect()
-    const cx = midX - rect.left
-    const cy = midY - rect.top
-    const curX = pendingView.x !== null ? pendingView.x : view.x
-    const curY = pendingView.y !== null ? pendingView.y : view.y
-    const curScale = pendingView.scale !== null ? pendingView.scale : view.scale
-    const newScale = Math.min(3, Math.max(0.12, pinchStart.scale * factor))
-    const ratio = newScale / curScale
-    const newX = cx - (cx - curX) * ratio
-    const newY = cy - (cy - curY) * ratio
+})
 
-    // Twist to rotate — a second finger turning around the first is the
-    // standard mobile "rotate the map" gesture (same as Google/Apple Maps).
-    const angle = angleOf(e.touches[0], e.touches[1])
-    const deltaDeg = ((angle - pinchStart.angle) * 180) / Math.PI
+onBeforeUnmount(() => {
+  canvasEl.value?.removeEventListener('wheel', onWheel)
+  resizeObserver?.disconnect()
+  window.removeEventListener('resize', syncSize)
+  renderer?.destroy()
+  renderer = null
+})
 
-    queueViewUpdate({ x: newX, y: newY, scale: newScale, rotation: pinchStart.rotation + deltaDeg })
-  }
-}
-function onTouchEnd(e) {
-  if (e.touches.length === 0) {
-    dragging.value = false
-    dragStart = null
-    pinchStart = null
-  }
-}
-
-function centerOn(node, scale = 1.4) {
-  if (!node || !viewportEl.value) return
-  view.scale = scale
-  view.x = viewportSize.width / 2 - node.x * scale
-  view.y = viewportSize.height / 2 - node.y * scale
-}
-
+// Data changes arrive in whole-array swaps (App.vue uses shallowRef), so a
+// plain reference watch is enough — no deep traversal of thousands of items.
+watch(
+  () => [props.nodes, props.edges],
+  () => renderer?.setData(props.nodes, props.edges)
+)
+watch(
+  () => props.selectedId,
+  (id) => renderer?.setSelected(id)
+)
+watch(dataMode, (mode) => renderer?.setAvatarsEnabled(mode !== 'off'))
 watch(
   () => props.focusToken?.nonce,
   () => {
-    const n = props.focusToken?.id && nodeById.value.get(props.focusToken.id)
-    if (n) centerOn(n)
+    const id = props.focusToken?.id
+    const node = id && props.nodes.find((n) => n.id === id)
+    if (node && renderer) renderer.centerOn(node)
   }
 )
-
-onMounted(() => {
-  if (viewportEl.value) {
-    updateViewportSize()
-    view.x = viewportSize.width / 2
-    view.y = viewportSize.height / 2
-  }
-  window.addEventListener('pointerup', onPointerUp)
-  window.addEventListener('resize', updateViewportSize)
-})
-onBeforeUnmount(() => {
-  window.removeEventListener('pointerup', onPointerUp)
-  window.removeEventListener('resize', updateViewportSize)
-  if (rafId !== null) cancelAnimationFrame(rafId)
-})
 </script>
 
 <template>
-  <div
-    ref="viewportEl"
-    class="galaxy-viewport"
-    @pointerdown="onPointerDown"
-    @pointermove="onPointerMove"
-    @wheel="onWheel"
-    @touchstart="onTouchStart"
-    @touchmove="onTouchMove"
-    @touchend="onTouchEnd"
-    @click="$emit('background-click')"
-  >
-    <div class="galaxy-field" :style="{ transform: `translate(${view.x}px, ${view.y}px) rotate(${view.rotation}deg) scale(${view.scale})` }">
-      <svg class="galaxy-links" overflow="visible">
-        <line
-          v-for="(e, i) in visibleEdges"
-          :key="i"
-          :x1="nodeXY(e.source).x"
-          :y1="nodeXY(e.source).y"
-          :x2="nodeXY(e.target).x"
-          :y2="nodeXY(e.target).y"
-          class="galaxy-link"
-          :style="{ '--w': edgeStyle(e).width, '--o': edgeStyle(e).opacity }"
-        />
-      </svg>
-      <StarNode
-        v-for="node in culledNodes"
-        :key="node.id"
-        :node="node"
-        :radius="radiusFor(node)"
-        :selected="node.id === selectedId"
-        :rotation="view.rotation"
-        @select="(n) => emit('select-star', n)"
-      />
-    </div>
+  <div ref="viewportEl" class="galaxy-viewport">
+    <canvas
+      ref="canvasEl"
+      class="galaxy-canvas"
+      role="img"
+      aria-label="Interactive map of Nostr accounts. Use the search box to find a specific account."
+      @pointerdown="onPointerDown"
+      @pointermove="onPointerMove"
+      @pointerup="(e) => endPointer(e, false)"
+      @pointercancel="(e) => endPointer(e, true)"
+    ></canvas>
 
     <button
       class="compass"
-      :class="{ 'compass--active': Math.abs(view.rotation % 360) > 1 }"
-      @click.stop="view.rotation = 0"
+      :class="{ 'compass--active': Math.abs(rotationDeg % 360) > 1 }"
+      @click.stop="resetRotation"
       aria-label="Reset rotation to north"
       title="Reset rotation"
     >
-      <span class="compass__needle" :style="{ transform: `rotate(${-view.rotation}deg)` }">▲</span>
+      <span class="compass__needle" :style="{ transform: `rotate(${-rotationDeg}deg)` }">▲</span>
     </button>
   </div>
 </template>
@@ -344,30 +236,13 @@ onBeforeUnmount(() => {
   cursor: grabbing;
 }
 
-.galaxy-field {
+.galaxy-canvas {
   position: absolute;
-  left: 0;
-  top: 0;
-  width: 0;
-  height: 0;
-  transform-origin: 0 0;
-  will-change: transform;
-}
-
-.galaxy-links {
-  position: absolute;
-  left: 0;
-  top: 0;
-  width: 1px;
-  height: 1px;
-  overflow: visible;
-  pointer-events: none;
-}
-
-.galaxy-link {
-  stroke: var(--star-white);
-  stroke-width: var(--w);
-  opacity: var(--o);
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
 }
 
 .compass {

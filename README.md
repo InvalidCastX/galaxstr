@@ -17,7 +17,8 @@ WebSocket.
 ## Stack
 
 - Vite + Vue 3 (`<script setup>`), plain CSS — no TypeScript, no Tailwind
-- `d3-force` for the galaxy layout simulation
+- `d3-force` for the galaxy layout simulation (in a Web Worker)
+- A single `<canvas>` 2D renderer for stars and links
 - A small hand-rolled NIP-01 WebSocket client (`src/nostr.js`) — no other
   Nostr library dependency
 - No backend, no database — everything runs client-side against public
@@ -96,19 +97,35 @@ profiles, and notes paged further back in time via `until` — up to the
 `MAX_PROFILES` / `MAX_EVENTS` ceiling. Nothing pulls in the whole network
 up front.
 
-Two more things keep it smooth as the galaxy grows:
+Performance design (what keeps hundreds of accounts smooth):
 
-- **Warm-started layout** — `layoutGalaxy` *pins* each star's previous
-  position across rebuilds (d3's `fx`/`fy`) instead of merely reheating it,
-  so already-placed stars hold completely still once settled — only
-  genuinely new stars are free to move into place. This is also why
-  tapping a star reliably selects it now, instead of chasing a star that's
-  still drifting from the last batch.
-- **Viewport culling** — `GalaxyView.vue` only mounts stars that are
-  actually on screen (plus a small margin), with a hard ceiling
-  (`MAX_RENDERED_STARS`) if you're zoomed out far enough to see hundreds
-  at once. Panning/zooming re-derives the visible set cheaply; it never
-  re-renders the whole galaxy's worth of DOM nodes at once.
+- **Canvas renderer** — `src/renderer.js` draws every star and link on one
+  `<canvas>` (cached glow sprites, batched link strokes, level-of-detail by
+  on-screen size, render-on-demand). The old version mounted ~6 DOM
+  elements per star with blur filters, which is what overwhelmed
+  browsers. Pan/zoom/rotate only mutate a plain camera object and repaint
+  once per animation frame — no Vue reactivity, no vdom diffing.
+- **Lazy avatars** — avatars are fetched only for stars that are on screen
+  *and* large enough to show a face, at most 6 at a time, then kept as small
+  pre-clipped sprites in an LRU. Failed images are never retried.
+- **Layout in a Web Worker** — `src/layout.worker.js` runs the d3-force
+  simulation off the main thread (falls back to the main thread if Workers
+  are unavailable). Only ids/links go in and a `Float32Array` of positions
+  comes back.
+- **Warm-started layout** — `computeLayout` *pins* each star's previous
+  position across rebuilds (d3's `fx`/`fy`), so settled stars hold still and
+  only genuinely new stars are simulated.
+- **Bounded graph** — notes that tag more than 8 accounts are ignored for
+  links (mention-spam), ghost accounts are dropped, and the star set is
+  trimmed to `maxNodes` (600 on touch devices) by activity/links/profile.
+- **Snapshot subscriptions** — each relay query is closed on EOSE instead of
+  streaming the live firehose forever; everything stops at `maxEvents`.
+  De-duplication is per subscription, so memory is released when it closes.
+- **Cheap state** — graph state lives in `shallowRef`s (no deep Proxy
+  wrapping), and rebuilds are debounced with a max-wait and never overlap.
+
+Run `node test/smoke.mjs` for Node-only checks of the graph pruning, camera
+math, hit-testing and avatar queue.
 
 ## Mobile controls
 
@@ -137,6 +154,7 @@ edited (or swapped per deployment) **without a rebuild**:
   "nostrCardBaseUrl": "https://nostrcard.vercel.app/#/p/",
   "maxProfiles": 500,
   "maxEvents": 5000,
+  "maxNodes": 1200,
   "initialProfileLimit": 120,
   "initialNoteLimit": 400,
   "initialRepostLimit": 150,
@@ -145,6 +163,8 @@ edited (or swapped per deployment) **without a rebuild**:
 }
 ```
 
+- `maxNodes` caps how many stars are laid out and drawn (touch devices use
+  at most 600). Raise it on powerful machines, lower it if a device struggles.
 - `nostrCardBaseUrl` is prepended to each user's `npub` when the "Open Full
   NostrCard" button is built — it currently points at NostrCard's hash-route
   pattern (`.../#/p/npub1...`); update it here if that ever changes.
@@ -163,8 +183,9 @@ edited (or swapped per deployment) **without a rebuild**:
    signal, plain mentions and reposts are medium, reactions and shared
    hashtags are the weakest. No follower-graph (kind 3) is used for the
    MVP layout, since Nostr follow lists are often incomplete.
-3. `layoutGalaxy` runs a `d3-force` simulation (link + charge + collide
-   forces) to position every star in 2D space.
+3. `computeLayout` (`src/layout.js`, run in a Web Worker) runs a `d3-force`
+   simulation (link + charge + collide forces) to position every star in 2D
+   space.
 4. `detectConstellations` finds connected components of the medium/strong
    edge subgraph and labels them "Possible community cluster: #topic" —
    never asserted as an official group.
@@ -182,10 +203,13 @@ src/
   main.js
   style.css            design tokens (color, type)
   nostr.js             WebSocket relay pool + npub/nprofile decoding
-  galaxy.js            event graph -> nodes/edges, clustering, force layout
+  galaxy.js            event graph -> nodes/edges, pruning, clustering
+  layout.js            force layout (pure; runs in the worker)
+  layout.worker.js     Web Worker entry for layout.js
+  layoutClient.js      promise wrapper + main-thread fallback
+  renderer.js          canvas drawing, camera, hit-testing, avatar cache
   components/
-    GalaxyView.vue      pan/zoom/drag star field + link rendering
-    StarNode.vue         a single glowing star
+    GalaxyView.vue      canvas host: pointer gestures (pan/pinch/twist/tap)
     ProfilePopup.vue     mini NostrCard preview + link to the full card
     SearchBox.vue        search by name / npub / nprofile / NIP-05
 public/

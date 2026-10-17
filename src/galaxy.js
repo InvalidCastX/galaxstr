@@ -5,16 +5,24 @@
 // Nothing here invents popularity scores. Sizes and colors are derived
 // only from events actually observed in the loaded window.
 
-import { forceSimulation, forceManyBody, forceLink, forceCenter, forceCollide } from 'd3-force'
+// (The force layout lives in layout.js so it can run inside a Web Worker.)
 
 const BCH_TAGS = ['bch', 'bitcoincash', 'cashtokens', 'cashtoken', 'bchnostr']
+
+// A note that tags dozens of accounts is mention-spam, not a signal about
+// who the author interacts with — and each tag would otherwise mint a new
+// star plus a link. Ignore p-tags on such notes.
+const MAX_P_TAGS_PER_NOTE = 8
+const MAX_TAGS_PER_EVENT = 8
+const DEFAULT_MAX_NODES = 1200
 
 export function extractHashtags(event) {
   const fromTags = (event.tags || [])
     .filter((t) => t[0] === 't' && t[1])
     .map((t) => t[1].toLowerCase())
   const fromContent = (event.content || '').match(/#(\w+)/g) || []
-  return new Set([...fromTags, ...fromContent.map((h) => h.slice(1).toLowerCase())])
+  const all = [...fromTags, ...fromContent.map((h) => h.slice(1).toLowerCase())]
+  return new Set(all.slice(0, MAX_TAGS_PER_EVENT))
 }
 
 /**
@@ -24,7 +32,10 @@ export function extractHashtags(event) {
  * reposts: kind 6 events
  * reactions: kind 7 events
  */
-export function buildGalaxy({ profiles, notes = [], reposts = [], reactions = [] }, { nowSec = Date.now() / 1000 } = {}) {
+export function buildGalaxy(
+  { profiles, notes = [], reposts = [], reactions = [] },
+  { nowSec = Date.now() / 1000, maxNodes = DEFAULT_MAX_NODES } = {}
+) {
   const nodes = new Map() // pubkey -> node
 
   function ensureNode(pubkey) {
@@ -35,6 +46,7 @@ export function buildGalaxy({ profiles, notes = [], reposts = [], reactions = []
         picture: null,
         nip05: null,
         about: null,
+        hasProfile: false,
         nip05Verified: false,
         firstSeen: null,
         lastActive: null,
@@ -62,6 +74,7 @@ export function buildGalaxy({ profiles, notes = [], reposts = [], reactions = []
     node.about = meta.about || null
     node.nip05 = meta.nip05 || null
     node.profileEventCreatedAt = event.created_at
+    node.hasProfile = true
   }
 
   // --- links accumulate here before becoming edges ---
@@ -100,12 +113,16 @@ export function buildGalaxy({ profiles, notes = [], reposts = [], reactions = []
       // so mentions (p-tags) are our reliable signal for "who this note is about".
       void marked
     }
-    for (const pTag of pTags) {
-      const mentioned = pTag[1]
-      if (mentioned) {
-        ensureNode(mentioned)
-        const weight = eTags.length > 0 ? 3 : 1 // reply-context mention vs plain mention
-        addLink(event.pubkey, mentioned, weight, eTags.length > 0 ? 'reply' : 'mention')
+    if (pTags.length <= MAX_P_TAGS_PER_NOTE) {
+      const seenMentions = new Set()
+      for (const pTag of pTags) {
+        const mentioned = pTag[1]
+        if (mentioned && !seenMentions.has(mentioned)) {
+          seenMentions.add(mentioned)
+          ensureNode(mentioned)
+          const weight = eTags.length > 0 ? 3 : 1 // reply-context mention vs plain mention
+          addLink(event.pubkey, mentioned, weight, eTags.length > 0 ? 'reply' : 'mention')
+        }
       }
     }
   }
@@ -203,7 +220,31 @@ export function buildGalaxy({ profiles, notes = [], reposts = [], reactions = []
     edges = edges.sort((a, b) => b.weight - a.weight).slice(0, MAX_EDGES)
   }
 
-  return { nodes: [...nodes.values()], edges }
+  // --- prune the star set ---
+  // Every p-tag can mint a star, so without this the node count (the real
+  // cost driver for layout + rendering) is bounded by nothing but the event
+  // count. Drop ghosts (no profile, no note, no surviving link), then keep
+  // only the `maxNodes` most meaningful stars.
+  const degree = new Map()
+  for (const e of edges) {
+    degree.set(e.source, (degree.get(e.source) || 0) + 1)
+    degree.set(e.target, (degree.get(e.target) || 0) + 1)
+  }
+  let kept = [...nodes.values()].filter((n) => n.hasProfile || n.noteCount > 0 || degree.has(n.id))
+  if (kept.length > maxNodes) {
+    const score = (n) => n.activity + Math.min(degree.get(n.id) || 0, 20) * 0.5 + (n.hasProfile ? 3 : 0)
+    kept = kept
+      .map((n) => [score(n), n])
+      .sort((a, b) => b[0] - a[0])
+      .slice(0, maxNodes)
+      .map((x) => x[1])
+  }
+  if (kept.length < nodes.size) {
+    const keptIds = new Set(kept.map((n) => n.id))
+    edges = edges.filter((e) => keptIds.has(e.source) && keptIds.has(e.target))
+  }
+
+  return { nodes: kept, edges }
 }
 
 /**
@@ -252,94 +293,4 @@ export function detectConstellations(nodes, edges, { minSize = 3 } = {}) {
     .sort((a, b) => b.size - a.size)
 
   return clusters
-}
-
-/**
- * Runs a force simulation to lay stars out in 2D space.
- *
- * Lazy-loading friendly: pass `previous` (a Map<id, {x,y,vx,vy}> from the
- * last layout). Already-placed stars are *pinned* at their previous
- * position (d3's fx/fy) rather than merely reheated — otherwise every
- * incoming batch nudges the whole graph and stars never sit still long
- * enough to tap. Only genuinely new stars are left free to settle in,
- * relative to that fixed backdrop.
- */
-export function layoutGalaxy(nodes, edges, { width = 2000, height = 1400, ticks = 300, previous = null } = {}) {
-  const isWarmStart = !!previous && previous.size > 0
-  let newCount = 0
-
-  const simNodes = nodes.map((n) => {
-    const prior = previous?.get(n.id)
-    if (prior) {
-      // Pinned: fx/fy hold it exactly in place through the simulation.
-      return { ...n, x: prior.x, y: prior.y, vx: 0, vy: 0, fx: prior.x, fy: prior.y }
-    }
-    newCount++
-    return { ...n }
-  })
-
-  const idIndex = new Map(simNodes.map((n) => [n.id, n]))
-  const simLinks = edges
-    .filter((e) => idIndex.has(e.source) && idIndex.has(e.target))
-    .map((e) => ({ ...e }))
-
-  if (isWarmStart) {
-    // Seed brand-new stars near an already-placed neighbor (if we can find
-    // one) so they drift into place from nearby instead of from the
-    // origin — cheaper to settle and calmer to watch appear.
-    for (const link of simLinks) {
-      const a = idIndex.get(link.source)
-      const b = idIndex.get(link.target)
-      if (a.x === undefined && b.x !== undefined) {
-        a.x = b.x + (Math.random() - 0.5) * 40
-        a.y = b.y + (Math.random() - 0.5) * 40
-      } else if (b.x === undefined && a.x !== undefined) {
-        b.x = a.x + (Math.random() - 0.5) * 40
-        b.y = a.y + (Math.random() - 0.5) * 40
-      }
-    }
-  }
-
-  // Nothing new arrived — every star is pinned, so there's nothing for a
-  // simulation to do. Skip it entirely rather than spend a single frame
-  // moving pixels that will immediately be reset by fx/fy anyway.
-  if (isWarmStart && newCount === 0) {
-    for (const n of simNodes) {
-      delete n.fx
-      delete n.fy
-    }
-    return simNodes
-  }
-
-  const sim = forceSimulation(simNodes)
-    .force(
-      'link',
-      forceLink(simLinks)
-        .id((d) => d.id)
-        .distance((l) => 260 - Math.min(l.weight, 10) * 18)
-        .strength((l) => Math.min(0.05 + l.weight * 0.02, 0.4))
-    )
-    .force('charge', forceManyBody().strength(-140))
-    .force('center', isWarmStart ? null : forceCenter(0, 0))
-    .force(
-      'collide',
-      forceCollide((d) => 26 + Math.sqrt(1 + d.activity) * 4.5).iterations(3)
-    )
-    .stop()
-
-  // Fresh galaxy: settle fully. Otherwise: only as many ticks as the new
-  // stars actually need to find a free spot against the pinned backdrop —
-  // existing stars can't move regardless, so there's no benefit to more.
-  const effectiveTicks = isWarmStart ? Math.min(160, Math.max(40, newCount * 5)) : ticks
-
-  for (let i = 0; i < effectiveTicks; i++) sim.tick()
-
-  // Unpin before handing back — the position cache stores plain x/y, and
-  // downstream code (rendering, hit-testing) doesn't expect fx/fy.
-  for (const n of simNodes) {
-    delete n.fx
-    delete n.fy
-  }
-
-  return simNodes
 }
